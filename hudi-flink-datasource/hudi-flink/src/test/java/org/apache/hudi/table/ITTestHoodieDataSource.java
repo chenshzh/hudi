@@ -39,6 +39,7 @@ import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.api.config.ExecutionConfigOptions;
 import org.apache.flink.table.api.internal.TableEnvironmentImpl;
 import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.catalog.WatermarkSpec;
 import org.apache.flink.table.catalog.exceptions.TableNotExistException;
 import org.apache.flink.test.util.AbstractTestBase;
 import org.apache.flink.types.Row;
@@ -451,6 +452,42 @@ public class ITTestHoodieDataSource extends AbstractTestBase {
     List<Row> result1 = CollectionUtil.iterableToList(
         () -> tableEnv.sqlQuery("select * from t1").execute().collect());
     assertRowsEquals(result1, "[+I[id1, Danny, 23, 1970-01-01T00:00:01, par1]]");
+  }
+
+  @ParameterizedTest
+  @EnumSource(value = HoodieTableType.class)
+  void testReadWithComputedColumnSyntax(HoodieTableType tableType) throws Exception {
+    String hoodieTableDDL = sql("t1")
+        .option(FlinkOptions.PATH, tempFile.getAbsolutePath())
+        .option(FlinkOptions.TABLE_NAME, tableType.name())
+        .option("hoodie.parquet.small.file.limit", "0") // invalidate the small file strategy
+        .option("hoodie.parquet.max.file.size", "0")
+        .noPartition()
+        .end();
+    batchTableEnv.executeSql(hoodieTableDDL);
+
+    // Firstly,  insert a dataset
+    execInsertSql(batchTableEnv, TestSQL.INSERT_T1);
+
+    // Secondly, query the source by stream source with computed column syntax
+    String queryHoodieTableDDL = "create table t2(\n"
+        + "  uuid varchar(20),\n"
+        + "  name varchar(10),\n"
+        + "  age int,\n"
+        + "  ts timestamp(3),\n"
+        + "  `partition` varchar(20),\n"
+        + "  wts as ts - INTERVAL '8' HOUR,\n" // define a computed column
+        + "  watermark for wts as wts,\n"
+        + "  PRIMARY KEY(uuid) NOT ENFORCED\n"
+        + ")\n"
+        + "with (\n"
+        + "  'connector' = 'hudi',\n"
+        + "  'path' = '" + tempFile.getAbsolutePath() + "',\n"
+        + "  'read.streaming.enabled' = 'true'\n"
+        + ")";
+    streamTableEnv.executeSql(queryHoodieTableDDL);
+    List<Row> result1 = execSelectSql(streamTableEnv, "select uuid,name,age,ts,`partition` from t2", 10);
+    assertRowsEquals(result1, TestData.DATA_SET_SOURCE_INSERT);
   }
 
   @ParameterizedTest

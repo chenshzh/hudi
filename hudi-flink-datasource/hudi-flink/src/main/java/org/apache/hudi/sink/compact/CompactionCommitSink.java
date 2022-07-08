@@ -20,6 +20,8 @@ package org.apache.hudi.sink.compact;
 
 import org.apache.hudi.avro.model.HoodieCompactionPlan;
 import org.apache.hudi.client.WriteStatus;
+import org.apache.hudi.commit.policy.CompactionWriteCommitPolicy;
+import org.apache.hudi.commit.policy.WriteCommitPolicy;
 import org.apache.hudi.common.data.HoodieListData;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.util.CompactionUtils;
@@ -128,19 +130,38 @@ public class CompactionCommitSink extends CleanFunction<CompactionCommitEvent> {
       return;
     }
 
-    if (events.stream().anyMatch(CompactionCommitEvent::isFailed)) {
-      try {
-        // handle failure case
-        CompactionUtil.rollbackCompaction(table, instant);
-      } finally {
-        // remove commitBuffer to avoid obsolete metadata commit
-        reset(instant);
-      }
-      return;
-    }
+    List<WriteStatus> statuses = events.stream()
+        .filter(event -> !event.isFailed())
+        .map(CompactionCommitEvent::getWriteStatuses)
+        .flatMap(Collection::stream)
+        .collect(Collectors.toList());
+    // commit or rollback
+    WriteCommitPolicy compactWriteCommitPolicy = new CompactionWriteCommitPolicy(
+        this::compactCommit,
+        this::compactRollback,
+        // here we should include the write errors under consideration as some write errors might cause data loss when compaction
+        () -> events.stream().anyMatch(CompactionCommitEvent::isFailed) || statuses.stream().anyMatch(WriteStatus::hasErrors),
+        this.conf.getBoolean(FlinkOptions.IGNORE_FAILED),
+        instant,
+        events
+        );
+    compactWriteCommitPolicy.initialize();
+    compactWriteCommitPolicy.handleCommitOrRollback();
+  }
 
+  private void compactRollback(String instant, List<WriteStatus> writeStatuses) {
     try {
-      doCommit(instant, events);
+      // handle failure case
+      CompactionUtil.rollbackCompaction(table, instant);
+    } finally {
+      // remove commitBuffer to avoid obsolete metadata commit
+      reset(instant);
+    }
+  }
+
+  private void compactCommit(String instant, List<WriteStatus> writeStatuses) {
+    try {
+      doCommit(instant, writeStatuses);
     } catch (Throwable throwable) {
       // make it fail-safe
       LOG.error("Error while committing compaction instant: " + instant, throwable);
@@ -151,12 +172,7 @@ public class CompactionCommitSink extends CleanFunction<CompactionCommitEvent> {
   }
 
   @SuppressWarnings("unchecked")
-  private void doCommit(String instant, Collection<CompactionCommitEvent> events) throws IOException {
-    List<WriteStatus> statuses = events.stream()
-        .map(CompactionCommitEvent::getWriteStatuses)
-        .flatMap(Collection::stream)
-        .collect(Collectors.toList());
-
+  private void doCommit(String instant, List<WriteStatus> statuses) throws IOException {
     HoodieCommitMetadata metadata = CompactHelpers.getInstance().createCompactionMetadata(
         table, instant, HoodieListData.eager(statuses), writeClient.getConfig().getSchema());
 

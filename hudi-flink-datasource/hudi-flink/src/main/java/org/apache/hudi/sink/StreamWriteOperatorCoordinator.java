@@ -20,6 +20,8 @@ package org.apache.hudi.sink;
 
 import org.apache.hudi.client.HoodieFlinkWriteClient;
 import org.apache.hudi.client.WriteStatus;
+import org.apache.hudi.commit.policy.DefaultWriteCommitPolicy;
+import org.apache.hudi.commit.policy.WriteCommitPolicy;
 import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.model.WriteOperationType;
@@ -510,46 +512,39 @@ public class StreamWriteOperatorCoordinator
   /**
    * Performs the actual commit action.
    */
-  @SuppressWarnings("unchecked")
   private void doCommit(String instant, List<WriteStatus> writeResults) {
     // commit or rollback
-    long totalErrorRecords = writeResults.stream().map(WriteStatus::getTotalErrorRecords).reduce(Long::sum).orElse(0L);
-    long totalRecords = writeResults.stream().map(WriteStatus::getTotalRecords).reduce(Long::sum).orElse(0L);
-    boolean hasErrors = totalErrorRecords > 0;
+    WriteCommitPolicy writeCommitPolicy = new DefaultWriteCommitPolicy(
+        this::commit,
+        this::rollback,
+        this.conf.getBoolean(FlinkOptions.IGNORE_FAILED),
+        instant,
+        writeResults);
+    writeCommitPolicy.initialize();
+    writeCommitPolicy.handleCommitOrRollback();
+  }
 
-    if (!hasErrors || this.conf.getBoolean(FlinkOptions.IGNORE_FAILED)) {
-      HashMap<String, String> checkpointCommitMetadata = new HashMap<>();
-      if (hasErrors) {
-        LOG.warn("Some records failed to merge but forcing commit since commitOnErrors set to true. Errors/Total="
-            + totalErrorRecords + "/" + totalRecords);
-      }
-
-      final Map<String, List<String>> partitionToReplacedFileIds = tableState.isOverwrite
-          ? writeClient.getPartitionToReplacedFileIds(tableState.operationType, writeResults)
-          : Collections.emptyMap();
-      boolean success = writeClient.commit(instant, writeResults, Option.of(checkpointCommitMetadata),
-          tableState.commitAction, partitionToReplacedFileIds);
-      if (success) {
-        reset();
-        this.ckpMetadata.commitInstant(instant);
-        LOG.info("Commit instant [{}] success!", instant);
-      } else {
-        throw new HoodieException(String.format("Commit instant [%s] failed!", instant));
-      }
+  @SuppressWarnings("unchecked")
+  private void commit(String instant, List<WriteStatus> writeResults) {
+    HashMap<String, String> checkpointCommitMetadata = new HashMap<>();
+    final Map<String, List<String>> partitionToReplacedFileIds = tableState.isOverwrite
+        ? writeClient.getPartitionToReplacedFileIds(tableState.operationType, writeResults)
+        : Collections.emptyMap();
+    boolean success = writeClient.commit(instant, writeResults, Option.of(checkpointCommitMetadata),
+        tableState.commitAction, partitionToReplacedFileIds);
+    if (success) {
+      reset();
+      this.ckpMetadata.commitInstant(instant);
+      LOG.info("Commit instant [{}] success!", instant);
     } else {
-      LOG.error("Error when writing. Errors/Total=" + totalErrorRecords + "/" + totalRecords);
-      LOG.error("The first 100 error messages");
-      writeResults.stream().filter(WriteStatus::hasErrors).limit(100).forEach(ws -> {
-        LOG.error("Global error for partition path {} and fileID {}: {}",
-            ws.getGlobalError(), ws.getPartitionPath(), ws.getFileId());
-        if (ws.getErrors().size() > 0) {
-          ws.getErrors().forEach((key, value) -> LOG.trace("Error for key:" + key + " and value " + value));
-        }
-      });
-      // Rolls back instant
-      writeClient.rollback(instant);
-      throw new HoodieException(String.format("Commit instant [%s] failed and rolled back !", instant));
+      throw new HoodieException(String.format("Commit instant [%s] failed!", instant));
     }
+  }
+
+  private void rollback(String instant, List<WriteStatus> writeResults) {
+    // Rolls back instant
+    writeClient.rollback(instant);
+    throw new HoodieException(String.format("Commit instant [%s] failed and rolled back !", instant));
   }
 
   @VisibleForTesting
